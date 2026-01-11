@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Survival Web 3D — Protótipo</title>
+<style>
+  /* ====== Layout/UI ====== */
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto;}
+  #app{position:fixed;inset:0;display:flex;flex-direction:column;}
+  canvas{display:block;width:100%;height:100%}
+  /* HUD */
+  #hud{
+    position:absolute;left:12px;top:12px;z-index:40;
+    display:flex;flex-direction:column;gap:8px;
+    color:#eaeaea;text-shadow:0 1px 2px rgba(0,0,0,0.6);
+    font-size:14px;
+  }
+  .stat {background:rgba(0,0,0,0.35);padding:6px 10px;border-radius:6px;min-width:220px;}
+  .bar {height:8px;background:#222;border-radius:4px;overflow:hidden;margin-top:6px}
+  .bar > i{display:block;height:100%}
+  #compass {position:absolute;right:12px;top:12px;background:rgba(0,0,0,0.35);padding:6px 10px;border-radius:6px;color:#fff}
+  /* Inventory */
+  #inventory {
+    position:absolute;left:50%;transform:translateX(-50%);bottom:12px;z-index:45;
+    background:rgba(0,0,0,0.5);padding:10px;border-radius:8px;display:grid;grid-template-columns:repeat(8,48px);gap:6px;
+  }
+  .slot {width:48px;height:48px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:4px;display:flex;align-items:center;justify-content:center; color:#fff; font-size:12px}
+  /* Quick tips */
+  #tips {position:absolute;left:12px;bottom:12px;color:#fff;font-size:13px;z-index:41;background:rgba(0,0,0,0.3);padding:8px;border-radius:6px}
+  /* Touch joystick placeholder */
+  #touch-controls{position:absolute;left:12px;bottom:80px;z-index:42;display:none}
+  @media (pointer:coarse){ #touch-controls{display:block} }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <div class="stat"><strong>Vida</strong>
+      <div class="bar"><i id="bar-health" style="width:100%;background:linear-gradient(90deg,#ff5f6d,#ffc371)"></i></div>
+    </div>
+    <div class="stat"><strong>Fome</strong>
+      <div class="bar"><i id="bar-hunger" style="width:100%;background:linear-gradient(90deg,#ffd27f,#ffb47a)"></i></div>
+    </div>
+    <div class="stat"><strong>Sede</strong>
+      <div class="bar"><i id="bar-thirst" style="width:100%;background:linear-gradient(90deg,#6dd5ed,#2193b0)"></i></div>
+    </div>
+    <div class="stat"><strong>Energia</strong>
+      <div class="bar"><i id="bar-stamina" style="width:100%;background:linear-gradient(90deg,#7ce3a9,#33d69f)"></i></div>
+    </div>
+  </div>
+  <div id="compass">N</div>
+  <div id="inventory" aria-label="Inventário">
+    <!-- 32 slots -->
+  </div>
+  <div id="tips">W/A/S/D mover — E interagir — Click para olhar — Long press (touch) para usar</div>
+  <div id="touch-controls"></div>
+</div>
+
+<script type="module">
+/* ============================
+   Protótipo de jogo de sobrevivência 3D
+   - Arquitetura modular inline para facilitar leitura
+   - Dependências via CDN (Three.js, cannon-es, SimplexNoise)
+   ============================ */
+
+import * as THREE from 'https://unpkg.com/three@0.157.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.157.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.157.0/examples/jsm/loaders/GLTFLoader.js';
+import SimplexNoise from 'https://unpkg.com/simplex-noise@2.4.0/dist/esm/simplex-noise.js';
+import * as CANNON from 'https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js';
+
+/* -------------------------
+   Config / Globals
+   -------------------------*/
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb); // will be driven by day/night
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+camera.position.set(0, 4, 10);
+
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.defaultContactMaterial.friction = 0.4;
+
+/* -------------------------
+   Lighting / Sky
+   -------------------------*/
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.left = -50; sun.shadow.camera.right = 50; sun.shadow.camera.top = 50; sun.shadow.camera.bottom = -50;
+sun.position.set(50,80,20);
+scene.add(sun);
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.4);
+scene.add(hemi);
+
+/* -------------------------
+   Terrain (procedural)
+   -------------------------*/
+const terrain = new THREE.Group();
+scene.add(terrain);
+
+function generateHeightMap(size=256, scale=3.5, height=12, seed=Date.now()){
+  const simplex = new SimplexNoise(String(seed));
+  const data = new Float32Array(size*size);
+  let idx = 0;
+  for(let x=0;x<size;x++){
+    for(let y=0;y<size;y++){
+      const nx = x/size - 0.5, ny = y/size - 0.5;
+      let e = 0;
+      let amp = 1, freq = 1;
+      for(let o=0;o<5;o++){
+        e += amp * simplex.noise2D(nx*freq*scale, ny*freq*scale);
+        amp *= 0.5; freq *= 2;
+      }
+      data[idx++] = e * height;
+    }
+  }
+  return {size, data};
+}
+
+function buildTerrainMesh(heightmap){
+  const {size,data} = heightmap;
+  const geom = new THREE.PlaneGeometry(200,200,size-1,size-1);
+  geom.rotateX(-Math.PI/2);
+  const verts = geom.attributes.position.array;
+  for(let i=0;i<verts.length/3;i++){
+    verts[i*3+1] = data[i];
+  }
+  geom.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({color:0x6b8e23, metalness:0.0, roughness:1});
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.receiveShadow = true;
+  mesh.castShadow = false;
+  return mesh;
+}
+
+const hm = generateHeightMap(128, 3.2, 10, 12345);
+const terrainMesh = buildTerrainMesh(hm);
+terrain.add(terrainMesh);
+
+/* add static physics body for terrain (heightfield) */
+function addTerrainBody(heightmap){
+  const {size,data} = heightmap;
+  // create heightfield for CANNON
+  const matrix = [];
+  for(let x=0;x<size;x++){
+    const row = [];
+    for(let z=0;z<size;z++){
+      row.push(data[z + x*size]);
+    }
+    matrix.push(row);
+  }
+  const hf = new CANNON.Heightfield(matrix, {
+    elementSize: 200/(size-1)
+  });
+  const body = new CANNON.Body({mass:0});
+  body.addShape(hf);
+  body.position.set(-100, 0, 100); // align with mesh
+  world.addBody(body);
+}
+addTerrainBody(hm);
+
+/* -------------------------
+   Water (simple plane)
+   -------------------------*/
+const waterGeo = new THREE.PlaneGeometry(200,200,1,1);
+const waterMat = new THREE.MeshStandardMaterial({color:0x2a7bd2, transparent:true, opacity:0.7});
+const water = new THREE.Mesh(waterGeo, waterMat);
+water.rotation.x = -Math.PI/2;
+water.position.y = -1.0;
+scene.add(water);
+
+/* -------------------------
+   Player (capsule) + physics
+   -------------------------*/
+class Player {
+  constructor(){
+    this.height = 1.8;
+    this.speed = 6;
+    this.runMultiplier = 1.6;
+    this.position = new THREE.Vector3(0,5,0);
+    this.velocity = new THREE.Vector3();
+    this.yaw = 0; this.pitch = 0;
+    // Stats
+    this.health = 100; this.hunger = 0; this.thirst = 0; this.stamina = 100; this.temperature = 37;
+    // Inventory
+    this.inventory = new Array(32).fill(null);
+    this.weight = 0;
+    // physics body (capsule approximation via sphere + cylinder)
+    const mass = 80;
+    const radius = 0.4;
+    const sphereTop = new CANNON.Sphere(radius);
+    const sphereBottom = new CANNON.Sphere(radius);
+    const cylinder = new CANNON.Cylinder(radius, radius, this.height-2*radius, 8);
+    this.body = new CANNON.Body({mass});
+    this.body.addShape(cylinder, new CANNON.Vec3(0,0,0));
+    this.body.addShape(sphereTop, new CANNON.Vec3(0,(this.height/2)-radius,0));
+    this.body.addShape(sphereBottom, new CANNON.Vec3(0,-(this.height/2)+radius,0));
+    this.body.position.set(this.position.x, this.position.y, this.position.z);
+    this.body.fixedRotation = true;
+    this.body.updateMassProperties();
+    world.addBody(this.body);
+  }
+  updateFromBody(){
+    this.position.set(this.body.position.x, this.body.position.y, this.body.position.z);
+  }
+}
+const player = new Player();
+
+/* Attach a simple camera rig to player */
+const cameraPivot = new THREE.Object3D();
+cameraPivot.position.set(0, player.height*0.85, 0);
+scene.add(cameraPivot);
+cameraPivot.add(camera);
+
+/* -------------------------
+   Basic Input System (unified)
+   -------------------------*/
+const input = {
+  forward:false,back:false,left:false,right:false,run:false,jump:false,
+  mouseDX:0,mouseDY:0,mouseDown:false, interact:false
+};
+
+window.addEventListener('keydown', e=>{
+  if(e.code==='KeyW') input.forward=true;
+  if(e.code==='KeyS') input.back=true;
+  if(e.code==='KeyA') input.left=true;
+  if(e.code==='KeyD') input.right=true;
+  if(e.code==='ShiftLeft') input.run=true;
+  if(e.code==='Space') input.jump=true;
+  if(e.code==='KeyE') input.interact=true;
+});
+window.addEventListener('keyup', e=>{
+  if(e.code==='KeyW') input.forward=false;
+  if(e.code==='KeyS') input.back=false;
+  if(e.code==='KeyA') input.left=false;
+  if(e.code==='KeyD') input.right=false;
+  if(e.code==='ShiftLeft') input.run=false;
+  if(e.code==='Space') input.jump=false;
+  if(e.code==='KeyE') input.interact=false;
+});
+
+let isPointerLocked = false;
+canvas.addEventListener('click', ()=> {
+  canvas.requestPointerLock?.();
+});
+document.addEventListener('pointerlockchange', ()=> {
+  isPointerLocked = document.pointerLockElement === canvas;
+});
+document.addEventListener('mousemove', (e)=>{
+  if(isPointerLocked){
+    const sensitivity = 0.0022;
+    player.yaw -= e.movementX * sensitivity;
+    player.pitch -= e.movementY * sensitivity;
+    player.pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, player.pitch));
+  }
+});
+
+/* Gamepad support (basic) */
+function pollGamepad(){
+  const gp = navigator.getGamepads && navigator.getGamepads()[0];
+  if(!gp) return;
+  input.forward = gp.axes[1] < -0.3;
+  input.back = gp.axes[1] > 0.3;
+  input.left = gp.axes[0] < -0.3;
+  input.right = gp.axes[0] > 0.3;
+  input.run = gp.buttons[0]?.pressed; // A
+  input.interact = gp.buttons[2]?.pressed; // X
+}
+
+/* -------------------------
+   Movement & physics integration
+   -------------------------*/
+const tempVec = new THREE.Vector3();
+function updatePlayer(dt){
+  // apply input to desired velocity
+  let dir = new THREE.Vector3();
+  if(input.forward) dir.z -= 1;
+  if(input.back) dir.z += 1;
+  if(input.left) dir.x -= 1;
+  if(input.right) dir.x += 1;
+  if(dir.lengthSq()>0) dir.normalize();
+  // rotate by yaw
+  dir.applyAxisAngle(new THREE.Vector3(0,1,0), player.yaw);
+  let desiredSpeed = player.speed * (input.run ? player.runMultiplier : 1.0);
+  const desiredVel = new CANNON.Vec3(dir.x * desiredSpeed, player.body.velocity.y, dir.z * desiredSpeed);
+  // simple velocity blending
+  const blend = 1 - Math.exp(-8 * dt);
+  player.body.velocity.x += (desiredVel.x - player.body.velocity.x) * blend;
+  player.body.velocity.z += (desiredVel.z - player.body.velocity.z) * blend;
+  // camera follow
+  player.updateFromBody();
+  cameraPivot.position.set(player.position.x, player.position.y + player.height*0.2, player.position.z);
+  camera.position.set(
+    Math.sin(player.yaw) * 0.1 + cameraPivot.position.x,
+    cameraPivot.position.y + 0.05,
+    Math.cos(player.yaw) * 0.1 + cameraPivot.position.z
+  );
+  camera.lookAt(cameraPivot.position.x, cameraPivot.position.y, cameraPivot.position.z);
+  // stamina / hunger / thirst simulation
+  if(input.run && dir.lengthSq()>0) player.stamina = Math.max(0, player.stamina - dt * 12);
+  else player.stamina = Math.min(100, player.stamina + dt * 8);
+  player.hunger += dt * 0.5 * 0.01; // slow hunger
+  player.thirst += dt * 0.8 * 0.01; // faster thirst
+}
+
+/* -------------------------
+   Inventory UI
+   -------------------------*/
+const invEl = document.getElementById('inventory');
+function buildInventoryUI(){
+  invEl.innerHTML = '';
+  for(let i=0;i<player.inventory.length;i++){
+    const slot = document.createElement('div');
+    slot.className = 'slot';
+    slot.dataset.index = i;
+    slot.innerText = player.inventory[i] ? player.inventory[i].label : '';
+    slot.addEventListener('click', ()=> {
+      // simple use / equip
+      if(player.inventory[i]){
+        const it = player.inventory[i];
+        if(it.type==='food'){
+          player.hunger = Math.max(0, player.hunger - it.value);
+          player.inventory[i] = null;
+          updateInventoryLabels();
+        }
+      }
+    });
+    invEl.appendChild(slot);
+  }
+}
+function updateInventoryLabels(){
+  const slots = invEl.querySelectorAll('.slot');
+  slots.forEach(s=>{
+    const i = Number(s.dataset.index);
+    s.innerText = player.inventory[i] ? player.inventory[i].label : '';
+  });
+}
+buildInventoryUI();
+
+/* example item */
+player.inventory[0] = {id:'apple',label:'Maçã',type:'food',value:20,weight:0.2};
+player.inventory[1] = {id:'water',label:'Água',type:'drink',value:40,weight:0.5};
+updateInventoryLabels();
+
+/* Crafting example */
+const RECIPES = [
+  {id:'campfire',requires:[ {id:'wood',qty:3} ], result:{id:'campfire',label:'Fogueira',type:'structure'}}
+];
+function craft(recipeId){
+  const r = RECIPES.find(x=>x.id===recipeId);
+  if(!r) return false;
+  // check inventory
+  const need = {};
+  r.requires.forEach(it=> need[it.id] = (need[it.id]||0) + it.qty);
+  const invCount = {};
+  player.inventory.forEach(it=>{ if(it) invCount[it.id] = (invCount[it.id]||0)+1; });
+  for(const id in need) if((invCount[id]||0) < need[id]) return false;
+  // consume (naive)
+  for(const id in need){
+    let rem = need[id];
+    for(let i=0;i<player.inventory.length && rem>0;i++){
+      if(player.inventory[i] && player.inventory[i].id===id){ player.inventory[i]=null; rem--; }
+    }
+  }
+  // place result in first free slot
+  for(let i=0;i<player.inventory.length;i++){
+    if(!player.inventory[i]){ player.inventory[i] = {...r.result}; break; }
+  }
+  updateInventoryLabels();
+  return true;
+}
+
+/* -------------------------
+   Ghost build & placement
+   -------------------------*/
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let ghost = null;
+function showGhost(){
+  if(ghost) return;
+  const g = new THREE.Mesh(new THREE.BoxGeometry(2,1.2,2), new THREE.MeshStandardMaterial({color:0x00ff00,transparent:true,opacity:0.4}));
+  g.renderOrder = 999;
+  scene.add(g);
+  ghost = g;
+}
+function hideGhost(){
+  if(!ghost) return;
+  scene.remove(ghost);
+  ghost = null;
+}
+canvas.addEventListener('mousemove', (e)=>{
+  pointer.x = (e.clientX/window.innerWidth)*2 - 1;
+  pointer.y = -(e.clientY/window.innerHeight)*2 + 1;
+});
+canvas.addEventListener('click', (e)=>{
+  if(ghost){
+    // finalize placement (spawn a static box)
+    const placed = new THREE.Mesh(new THREE.BoxGeometry(2,1.2,2), new THREE.MeshStandardMaterial({color:0x8b5a2b}));
+    placed.position.copy(ghost.position);
+    placed.castShadow=true;
+    scene.add(placed);
+    // add physics body
+    const body = new CANNON.Body({mass:0});
+    body.addShape(new CANNON.Box(new CANNON.Vec3(1,0.6,1)));
+    body.position.set(placed.position.x, placed.position.y, placed.position.z);
+    world.addBody(body);
+  } else {
+    showGhost();
+  }
+});
+
+/* -------------------------
+   AI: simple animal example (FSM)
+   -------------------------*/
+class Animal {
+  constructor(pos=new THREE.Vector3()){
+    this.group = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.5,1.2), new THREE.MeshStandardMaterial({color:0x8a6f4f}));
+    mesh.castShadow = true;
+    this.group.add(mesh);
+    scene.add(this.group);
+    this.pos = pos.clone();
+    this.group.position.copy(this.pos);
+    this.state = 'idle';
+    this.timer = 0;
+  }
+  update(dt){
+    this.timer -= dt;
+    if(this.state==='idle' && this.timer <= 0){
+      this.state = 'wander';
+      this.timer = 4 + Math.random()*6;
+      this.target = this.pos.clone().add(new THREE.Vector3((Math.random()-0.5)*8,0,(Math.random()-0.5)*8));
+    }
+    if(this.state==='wander'){
+      const dir = this.target.clone().sub(this.group.position);
+      if(dir.length() > 0.1){
+        dir.normalize();
+        this.group.position.addScaledVector(dir, dt * 1.5);
+      } else {
+        this.state = 'idle';
+        this.timer = 2 + Math.random()*4;
+      }
+    }
+    // detect player too close -> flee
+    const d = this.group.position.distanceTo(player.position);
+    if(d < 5){
+      this.state = 'flee';
+      const dir = this.group.position.clone().sub(player.position).normalize();
+      this.group.position.addScaledVector(dir, dt * 4.0);
+    }
+  }
+}
+const animals = [];
+for(let i=0;i<8;i++){
+  animals.push(new Animal(new THREE.Vector3((Math.random()-0.5)*80,2,(Math.random()-0.5)*80)));
+}
+
+/* -------------------------
+   Environment: trees (instanced)
+   -------------------------*/
+function scatterTrees(count=300){
+  const treeGeo = new THREE.ConeGeometry(0.8,3,6);
+  const trunkGeo = new THREE.CylinderGeometry(0.18,0.18,1,6);
+  const mat = new THREE.MeshStandardMaterial({color:0x2e8b57});
+  const trunkMat = new THREE.MeshStandardMaterial({color:0x8b5a2b});
+  for(let i=0;i<count;i++){
+    const x = (Math.random()-0.5)*180;
+    const z = (Math.random()-0.5)*180;
+    const y = 2 + Math.random()*4;
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+    trunk.position.set(x, y-0.6, z);
+    trunk.castShadow = true;
+    scene.add(trunk);
+    const leaves = new THREE.Mesh(treeGeo, mat);
+    leaves.position.set(x, y+0.8, z);
+    leaves.castShadow = true;
+    scene.add(leaves);
+  }
+}
+scatterTrees(200);
+
+/* -------------------------
+   UI updates
+   -------------------------*/
+function updateHUD(){
+  document.getElementById('bar-health').style.width = Math.max(0, player.health) + '%';
+  document.getElementById('bar-hunger').style.width = Math.max(0, 100-player.hunger*100) + '%';
+  document.getElementById('bar-thirst').style.width = Math.max(0, 100-player.thirst*100) + '%';
+  document.getElementById('bar-stamina').style.width = Math.max(0, player.stamina) + '%';
+  // compass (yaw to degrees)
+  const deg = ((player.yaw * 180/Math.PI) % 360 + 360) % 360;
+  const dirs = ['N','NE','E','SE','S','SW','W','NW'];
+  const idx = Math.floor((deg + 22.5) / 45) % 8;
+  document.getElementById('compass').innerText = dirs[idx] + ' ' + Math.round(deg) + 'º';
+}
+
+/* -------------------------
+   Save / Load
+   -------------------------*/
+function saveGame(){
+  const data = {
+    player: {
+      pos:[player.position.x, player.position.y, player.position.z],
+      stats: {health:player.health, hunger:player.hunger, thirst:player.thirst, stamina:player.stamina},
+      inventory: player.inventory
+    },
+    timestamp: Date.now()
+  };
+  try{ localStorage.setItem('survival_save_v1', JSON.stringify(data)); console.log('Saved'); } catch(e){ console.warn('Save failed', e) }
+}
+function loadGame(){
+  try{
+    const s = localStorage.getItem('survival_save_v1');
+    if(!s) return;
+    const data = JSON.parse(s);
+    if(data.player){
+      player.body.position.set(data.player.pos[0], data.player.pos[1], data.player.pos[2]);
+      player.health = data.player.stats.health;
+      player.hunger = data.player.stats.hunger;
+      player.thirst = data.player.stats.thirst;
+      player.stamina = data.player.stats.stamina;
+      player.inventory = data.player.inventory;
+      updateInventoryLabels();
+    }
+  }catch(e){console.warn('Load failed', e)}
+}
+loadGame();
+
+/* Autosave interval */
+setInterval(saveGame, 20000);
+
+/* -------------------------
+   Main loop
+   -------------------------*/
+let last = performance.now();
+function loop(t){
+  const now = performance.now();
+  let dt = (now - last) / 1000;
+  last = now;
+  if(dt > 0.1) dt = 0.1;
+  pollGamepad();
+  updatePlayer(dt);
+  // update animals
+  for(const a of animals) a.update(dt);
+  // physics step
+  world.step(1/60, dt, 3);
+  // render
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  renderer.render(scene, camera);
+  updateHUD();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* -------------------------
+   Resize
+   -------------------------*/
+window.addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight, false);
+});
+renderer.setSize(innerWidth, innerHeight, false);
+
+/* -------------------------
+   Developer notes
+   -------------------------
+   - Expand GLTF loading: use GLTFLoader to import characters, animals and animations.
+   - Replace simple geometry with instanced meshes and LODs for performance.
+   - Add postprocessing composer (UnrealBloomPass, SSAO) for final look.
+   - Integrate ammo.js for advanced ragdoll and destructible objects if required.
+   - Add Behavior Tree library for complex NPC behaviors.
+   - Implement network schema and authoritative server for multiplayer persistence.
+   -------------------------*/
+</script>
+</body>
+</html>
